@@ -1,0 +1,32 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pyc
+
+# Environment / secrets -- NEVER COMMIT THESE
+.env
+.env.*
+!.env.example
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Pipeline outputs (large, auto-generated)
+output.csv
+code/evaluation/evaluation_results.csv
+code/evaluation/evaluation_report.md
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Logs (stored outside repo per AGENTS.md §2)
+*.log
