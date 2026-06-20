@@ -1,32 +1,37 @@
 """
-evaluation/main.py — Stage 5: Evaluation Framework.
+evaluation/main.py -- Stage 5: Evaluation Framework.
 
 Runs the full pipeline on dataset/sample_claims.csv (which has ground truth)
 and computes field-level accuracy metrics.
 
+Features:
+  - Checkpoint/resume: saves progress after every successful claim.
+    If a run is interrupted by a 429, re-running picks up from the last saved claim.
+  - Patience mode: MAX_RETRIES honoured from vlm_analyzer; delay between calls
+    is set conservatively to avoid hitting rate limits.
+
 Usage:
     python code/evaluation/main.py
-    python code/evaluation/main.py --delay 6    # seconds between API calls
+    python code/evaluation/main.py --delay 90   # extra patient (safe for free tier)
+    python code/evaluation/main.py --resume     # continue from checkpoint
+    python code/evaluation/main.py --fresh      # ignore checkpoint, start over
 """
 
 import argparse
 import csv
+import json
 import logging
-import os
 import sys
 import time
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 
-# Make the code/ directory importable
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from config import (
     EVIDENCE_REQUIREMENTS_CSV,
     GEMINI_API_KEY,
     INTER_CALL_DELAY_SECONDS,
-    OUTPUT_COLUMNS,
-    REPO_ROOT,
     SAMPLE_CLAIMS_CSV,
     USER_HISTORY_CSV,
 )
@@ -53,8 +58,8 @@ logger = logging.getLogger(__name__)
 EVAL_DIR = Path(__file__).parent
 RESULTS_CSV = EVAL_DIR / "evaluation_results.csv"
 REPORT_PATH = EVAL_DIR / "evaluation_report.md"
+CHECKPOINT_PATH = EVAL_DIR / "checkpoint.json"
 
-# Fields we can score against ground truth
 SCOREABLE_FIELDS = [
     "evidence_standard_met",
     "claim_status",
@@ -64,16 +69,34 @@ SCOREABLE_FIELDS = [
 ]
 
 
-# ── Metrics ───────────────────────────────────────────────────────────────────
+# -- Checkpoint helpers --------------------------------------------------------
+
+def load_checkpoint() -> Dict:
+    """Load saved progress. Returns dict with 'results' and 'done_ids'."""
+    if CHECKPOINT_PATH.exists():
+        with open(CHECKPOINT_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+        logger.info("Checkpoint loaded: %d claims already done.", len(data["done_ids"]))
+        return data
+    return {"results": [], "done_ids": []}
+
+
+def save_checkpoint(results: List[Dict], done_ids: List[str]) -> None:
+    with open(CHECKPOINT_PATH, "w", encoding="utf-8") as f:
+        json.dump({"results": results, "done_ids": done_ids}, f)
+
+
+def clear_checkpoint() -> None:
+    if CHECKPOINT_PATH.exists():
+        CHECKPOINT_PATH.unlink()
+        logger.info("Checkpoint cleared -- starting fresh.")
+
+
+# -- Metrics -------------------------------------------------------------------
 
 def compute_metrics(results: List[Dict]) -> Dict[str, float]:
-    """
-    Compute per-field exact-match accuracy.
-    Also computes risk_flag overlap (Jaccard) and a composite score.
-    """
     if not results:
         return {}
-
     n = len(results)
     scores: Dict[str, float] = {}
 
@@ -85,7 +108,6 @@ def compute_metrics(results: List[Dict]) -> Dict[str, float]:
         )
         scores[field] = correct / n
 
-    # Risk flag overlap: Jaccard similarity per row, averaged
     jaccard_scores = []
     for r in results:
         pred_flags = set(r.get("pred_risk_flags", "").split(";")) - {"", "none"}
@@ -95,12 +117,9 @@ def compute_metrics(results: List[Dict]) -> Dict[str, float]:
         elif not pred_flags or not gt_flags:
             jaccard_scores.append(0.0)
         else:
-            inter = len(pred_flags & gt_flags)
-            union = len(pred_flags | gt_flags)
-            jaccard_scores.append(inter / union)
+            jaccard_scores.append(len(pred_flags & gt_flags) / len(pred_flags | gt_flags))
     scores["risk_flags_jaccard"] = sum(jaccard_scores) / n
 
-    # Overall composite (weighted)
     weights = {
         "claim_status": 3,
         "evidence_standard_met": 2,
@@ -110,28 +129,35 @@ def compute_metrics(results: List[Dict]) -> Dict[str, float]:
         "risk_flags_jaccard": 1,
     }
     total_w = sum(weights.values())
-    composite = sum(scores.get(f, 0) * w for f, w in weights.items()) / total_w
-    scores["composite"] = composite
-
+    scores["composite"] = sum(scores.get(f, 0) * w for f, w in weights.items()) / total_w
     return scores
 
 
 def print_metrics(scores: Dict[str, float], n: int) -> None:
-    print(f"\n{'='*50}")
+    print(f"\n{'='*52}")
     print(f"  EVALUATION RESULTS  (n={n})")
-    print(f"{'='*50}")
+    print(f"{'='*52}")
     for field, score in scores.items():
         bar = "#" * int(score * 20)
         print(f"  {field:<28} {score:5.1%}  [{bar:<20}]")
-    print(f"{'='*50}\n")
+    print(f"{'='*52}\n")
 
 
-# ── Main evaluation loop ───────────────────────────────────────────────────────
+# -- Main evaluation loop ------------------------------------------------------
 
-def run_evaluation(delay: float = INTER_CALL_DELAY_SECONDS) -> None:
+def run_evaluation(delay: float = INTER_CALL_DELAY_SECONDS,
+                   resume: bool = True,
+                   fresh: bool = False) -> None:
     if not GEMINI_API_KEY:
         logger.error("GEMINI_API_KEY env var not set.")
         sys.exit(1)
+
+    if fresh:
+        clear_checkpoint()
+
+    checkpoint = load_checkpoint() if resume else {"results": [], "done_ids": []}
+    results: List[Dict] = checkpoint["results"]
+    done_ids: List[str] = checkpoint["done_ids"]
 
     logger.info("Loading datasets...")
     sample_claims = load_claims(SAMPLE_CLAIMS_CSV)
@@ -139,14 +165,14 @@ def run_evaluation(delay: float = INTER_CALL_DELAY_SECONDS) -> None:
     evidence_reqs_map = load_evidence_requirements(EVIDENCE_REQUIREMENTS_CSV)
     client = build_client()
 
-    results: List[Dict] = []
-    predictions: List[Dict] = []
+    pending = [c for c in sample_claims if c.user_id not in done_ids]
+    total = len(sample_claims)
+    logger.info("Model: %s | Delay: %ss | %d/%d claims remaining",
+                __import__("config").GEMINI_MODEL, delay, len(pending), total)
 
-    logger.info("Running pipeline on %d sample claims...", len(sample_claims))
-
-    for i, claim in enumerate(sample_claims):
-        logger.info("[%d/%d] %s | %s", i + 1, len(sample_claims),
-                    claim.user_id, claim.claim_object)
+    for claim in pending:
+        i = total - len(pending) + pending.index(claim) + 1
+        logger.info("[%d/%d] %s | %s", i, total, claim.user_id, claim.claim_object)
 
         uh = get_user_history(claim.user_id, user_history_map)
         reqs = get_evidence_requirements(claim.claim_object, evidence_reqs_map)
@@ -165,10 +191,7 @@ def run_evaluation(delay: float = INTER_CALL_DELAY_SECONDS) -> None:
 
         vlm_output = analyze_claim(prompt, image_paths, client, image_ids)
         output_row = apply_rules(vlm_output, claim, uh)
-        pred = output_row.model_dump()
-        predictions.append(pred)
 
-        # Build comparison record
         result = {
             "user_id": claim.user_id,
             "claim_object": claim.claim_object,
@@ -186,17 +209,21 @@ def run_evaluation(delay: float = INTER_CALL_DELAY_SECONDS) -> None:
             "gt_risk_flags": claim.risk_flags or "",
         }
         results.append(result)
+        done_ids.append(claim.user_id)
 
-        # Show live diff
         match = output_row.claim_status == (claim.claim_status or "")
-        status = "[MATCH]" if match else "[DIFF ]"
-        logger.info("  %s claim_status pred=%s  gt=%s",
-                    status, output_row.claim_status, claim.claim_status)
+        logger.info("  %s claim_status pred=%-26s gt=%s",
+                    "[MATCH]" if match else "[DIFF ]",
+                    output_row.claim_status, claim.claim_status)
 
-        if i < len(sample_claims) - 1:
+        # Save after every claim so a 429 crash loses nothing
+        save_checkpoint(results, done_ids)
+        logger.info("  Checkpoint saved (%d/%d done).", len(done_ids), total)
+
+        if pending.index(claim) < len(pending) - 1:
             time.sleep(delay)
 
-    # ── Save results CSV ───────────────────────────────────────────────────────
+    # -- Final output ----------------------------------------------------------
     EVAL_DIR.mkdir(parents=True, exist_ok=True)
     with open(RESULTS_CSV, "w", newline="", encoding="utf-8") as fh:
         writer = csv.DictWriter(fh, fieldnames=list(results[0].keys()))
@@ -204,13 +231,14 @@ def run_evaluation(delay: float = INTER_CALL_DELAY_SECONDS) -> None:
         writer.writerows(results)
     logger.info("Saved evaluation comparison to %s", RESULTS_CSV)
 
-    # ── Compute and display metrics ────────────────────────────────────────────
     scores = compute_metrics(results)
     print_metrics(scores, len(results))
 
-    # ── Write evaluation report ────────────────────────────────────────────────
-    _write_report(scores, len(sample_claims), len(results))
+    _write_report(scores, total, len(results))
     logger.info("Evaluation report written to %s", REPORT_PATH)
+
+    # Clear checkpoint on clean completion
+    clear_checkpoint()
 
 
 def _write_report(scores: Dict[str, float], n_claims: int, n_evaluated: int) -> None:
@@ -223,39 +251,15 @@ def _write_report(scores: Dict[str, float], n_claims: int, n_evaluated: int) -> 
     ]
     for field, score in scores.items():
         lines.append(f"| `{field}` | {score:.1%} |")
-
-    lines += [
-        "\n## Operational Analysis\n",
-        f"- **Model calls**: {n_claims} for sample, ~44 for test set",
-        f"- **Images per call**: ~1-3 (avg. ~2)",
-        f"- **Delay between calls**: {INTER_CALL_DELAY_SECONDS}s (stays under 10 RPM free-tier limit)",
-        f"- **Estimated runtime** (sample): ~{n_claims * INTER_CALL_DELAY_SECONDS // 60}m {n_claims * INTER_CALL_DELAY_SECONDS % 60}s",
-        f"- **Estimated runtime** (test, 44 claims): ~{44 * INTER_CALL_DELAY_SECONDS // 60}m {44 * INTER_CALL_DELAY_SECONDS % 60}s",
-        "",
-        "### Token estimates (Gemini 2.5 Flash)",
-        "- Input tokens per call: ~1,500 text + ~500 per image = ~2,500 avg",
-        "- Output tokens per call: ~300 (JSON response)",
-        "- Total input tokens (44 test): ~110,000",
-        "- Total output tokens (44 test): ~13,200",
-        "",
-        "### Cost estimate (Gemini 2.5 Flash pricing)",
-        "- Input: $0.075 / 1M tokens -> 110k tokens ~$0.008",
-        "- Output: $0.30 / 1M tokens -> 13k tokens ~$0.004",
-        "- **Total estimated cost: < $0.02 for the full test set**",
-        "",
-        "### Rate limit strategy",
-        "- Free tier: 10 RPM, 250k TPM",
-        f"- Inter-call delay: {INTER_CALL_DELAY_SECONDS}s -> ~10 RPM max",
-        "- Retry: 3 attempts with exponential backoff (10s, 20s, 40s)",
-        "- No caching needed at this scale; all 44 claims processed sequentially",
-    ]
-
     REPORT_PATH.write_text("\n".join(lines), encoding="utf-8")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Evaluate claim pipeline on sample_claims.csv")
-    parser.add_argument("--delay", type=float, default=INTER_CALL_DELAY_SECONDS,
-                        help="Seconds between API calls (default: %(default)s)")
+    parser.add_argument("--delay", type=float, default=INTER_CALL_DELAY_SECONDS)
+    parser.add_argument("--resume", action="store_true", default=True,
+                        help="Resume from checkpoint if available (default: on)")
+    parser.add_argument("--fresh", action="store_true", default=False,
+                        help="Ignore checkpoint and start from scratch")
     args = parser.parse_args()
-    run_evaluation(delay=args.delay)
+    run_evaluation(delay=args.delay, resume=args.resume, fresh=args.fresh)

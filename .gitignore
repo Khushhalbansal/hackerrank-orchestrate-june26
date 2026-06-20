@@ -30,3 +30,4 @@ code/evaluation/evaluation_report.md
 
 # Logs (stored outside repo per AGENTS.md §2)
 *.log
+code/evaluation/checkpoint.json

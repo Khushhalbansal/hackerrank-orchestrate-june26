@@ -25,16 +25,20 @@ OUTPUT_CSV = REPO_ROOT / "output.csv"
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 
 # Override model via env var for flexibility:
-#   set GEMINI_MODEL=gemini-1.5-flash   (free tier 1500 RPD, use for evaluation)
-#   set GEMINI_MODEL=gemini-2.5-flash   (free tier 20 RPD, use for final output)
+#   set GEMINI_MODEL=gemini-2.5-flash   (free tier: 20 RPD -- default)
+#   set GEMINI_MODEL=gemini-2.0-flash   (paid accounts)
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 
 # -- Rate-limit / retry settings -----------------------------------------------
-# gemini-2.5-flash free tier: 10 RPM, 20 RPD. 7s delay stays under 10 RPM.
-# gemini-1.5-flash free tier: 15 RPM, 1500 RPD. 5s delay is sufficient.
-INTER_CALL_DELAY_SECONDS = int(os.environ.get("GEMINI_DELAY", "7"))
-MAX_RETRIES = 3
-RETRY_BASE_DELAY_SECONDS = 10  # exponential backoff base
+# Free tier: 10 RPM, 20 RPD. Use a conservative delay.
+# GEMINI_DELAY env var overrides; default 90s keeps us well under RPM limit
+# and works around sporadic daily-quota 429s with patience.
+INTER_CALL_DELAY_SECONDS = int(os.environ.get("GEMINI_DELAY", "90"))
+
+# MAX_RETRIES=8: each 429 retry waits the retryDelay hint (~60s), so 8 attempts
+# = up to ~8 minutes of patience per claim before giving up.
+MAX_RETRIES = int(os.environ.get("GEMINI_MAX_RETRIES", "8"))
+RETRY_BASE_DELAY_SECONDS = 10  # fallback; actual wait uses retryDelay from 429
 
 # -- Output column order (must match problem_statement.md exactly) -------------
 OUTPUT_COLUMNS = [
